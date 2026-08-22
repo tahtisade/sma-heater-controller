@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 
+"""
+SMA Heater Controller v2.0.1
+============================
+
+Korjaukset v2.0.0 -> v2.0.1:
+- Arduino-portti /dev/ttyACM0
+- ALIVE POWER=... -viestit ohitetaan
+- HEATER_CONTROLLER_READY ohitetaan komentovastauksissa
+- SET_POWER odottaa juuri oikeaa OK POWER=xxxx -vastausta
+- vanhat sarjaviestit eivät sotke seuraavaa komentoa
+- shutdown SET_POWER 0 odottaa oikeaa kuittausta
+"""
+
 import time
 import signal
 import sys
@@ -9,13 +22,13 @@ import serial
 
 
 # ============================================================
-# CONFIGURATION
+# ASETUKSET
 # ============================================================
 
-API_URL = "http://localhost:8080/api/status"
-
-SERIAL_PORT = "/dev/ttyACM1"
+SERIAL_PORT = "/dev/ttyACM0"
 SERIAL_BAUD = 9600
+
+SMA_API_URL = "http://localhost:8080/api/status"
 
 TARGET_GRID_POWER = -100.0
 
@@ -25,180 +38,192 @@ DEADBAND_HIGH = -70.0
 MAX_POWER = 6000
 
 LOOP_INTERVAL = 1.0
+CONTROL_DELAY = 1.0
+
+SERIAL_TIMEOUT = 2.0
 
 
 # ============================================================
-# POWER STEP SETTINGS
+# POWER STEP -LOGIIKKA
 # ============================================================
 
-EXPORT_STEP_300 = 500
-EXPORT_STEP_200 = 250
-EXPORT_STEP_100 = 100
-EXPORT_STEP_50 = 50
+def calculate_step(grid_power):
 
-IMPORT_STEP_300 = 500
-IMPORT_STEP_200 = 250
-IMPORT_STEP_100 = 100
-IMPORT_STEP_50 = 50
+    # --------------------------------------------------------
+    # EXPORT
+    # --------------------------------------------------------
 
+    if grid_power < DEADBAND_LOW:
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-arduino = None
-running = True
-
-
-# ============================================================
-# SIGNAL HANDLER
-# ============================================================
-
-def signal_handler(signum, frame):
-
-    global running
-
-    print()
-    print("Controller pysäytetään...")
-
-    running = False
-
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-
-# ============================================================
-# ARDUINO CONNECTION
-# ============================================================
-
-def connect_arduino():
-
-    global arduino
-
-    print()
-    print(f"Yhdistetään Arduinoon: {SERIAL_PORT}")
-    print()
-
-    try:
-
-        arduino = serial.Serial(
-            SERIAL_PORT,
-            SERIAL_BAUD,
-            timeout=1
+        export_power = abs(
+            grid_power - TARGET_GRID_POWER
         )
 
-        # Arduino UNO voi resetointua kun
-        # sarjaportti avataan.
-        time.sleep(2)
+        if export_power > 500:
+            return +300
 
-        print("Arduino-yhteys valmis.")
+        if export_power > 250:
+            return +200
 
-        # ----------------------------------------------------
-        # Luetaan mahdollinen READY-viesti.
-        #
-        # Tärkeää:
-        # HEATER_CONTROLLER_READY ei ole vastaus
-        # SET_POWER-komentoon.
-        # ----------------------------------------------------
+        if export_power > 100:
+            return +100
 
-        arduino.reset_input_buffer()
+        if export_power > 50:
+            return +50
 
-        time.sleep(0.2)
+        return 0
 
-        while arduino.in_waiting:
+    # --------------------------------------------------------
+    # IMPORT
+    # --------------------------------------------------------
 
-            line = arduino.readline()
+    if grid_power > DEADBAND_HIGH:
 
-            if not line:
-                break
-
-            text = line.decode(
-                "utf-8",
-                errors="replace"
-            ).strip()
-
-            if text:
-
-                print(
-                    f"Arduino: {text}"
-                )
-
-        return True
-
-    except Exception as e:
-
-        print(
-            f"Arduino-yhteyden avaus epäonnistui: {e}"
+        import_power = abs(
+            grid_power - TARGET_GRID_POWER
         )
 
-        arduino = None
+        if import_power > 500:
+            return -300
 
-        return False
+        if import_power > 250:
+            return -200
+
+        if import_power > 100:
+            return -100
+
+        if import_power > 50:
+            return -50
+
+        return 0
+
+    # --------------------------------------------------------
+    # DEADBAND
+    # --------------------------------------------------------
+
+    return 0
 
 
 # ============================================================
-# ARDUINO COMMAND
+# SMA API
 # ============================================================
 
-def send_command(command):
+def read_grid_power():
 
-    if arduino is None:
-        return None
+    response = requests.get(
+        SMA_API_URL,
+        timeout=3
+    )
 
-    try:
+    response.raise_for_status()
 
-        # ----------------------------------------------------
-        # Tyhjennetään vanha data ennen uuden komennon
-        # lähettämistä.
-        #
-        # Tämä estää READY- tai vanhan OK-viestin
-        # sekoittumisen uuteen komentoon.
-        # ----------------------------------------------------
+    data = response.json()
 
-        arduino.reset_input_buffer()
+    summary = data.get(
+        "summary",
+        {}
+    )
 
-        # ----------------------------------------------------
-        # Lähetetään komento
-        # ----------------------------------------------------
+    if "grid_power" in summary:
 
-        arduino.write(
-            (command + "\n").encode("ascii")
+        return float(
+            summary["grid_power"]
         )
 
-        arduino.flush()
+    energy_meter = data.get(
+        "energy_meter",
+        {}
+    )
 
-        # ----------------------------------------------------
-        # Odotetaan vastausta
-        # ----------------------------------------------------
+    if "grid_power" in energy_meter:
 
-        response = arduino.readline()
+        return float(
+            energy_meter["grid_power"]
+        )
 
-        if not response:
+    raise ValueError(
+        "API-vastauksesta puuttuu grid_power"
+    )
+
+
+# ============================================================
+# ARDUINO SERIAL
+# ============================================================
+
+def read_serial_line(ser, timeout=SERIAL_TIMEOUT):
+
+    deadline = (
+        time.monotonic()
+        + timeout
+    )
+
+    while (
+        time.monotonic()
+        < deadline
+    ):
+
+        try:
+
+            line = ser.readline()
+
+        except Exception:
 
             return None
 
-        text = response.decode(
+        if not line:
+            continue
+
+        text = line.decode(
             "utf-8",
             errors="replace"
         ).strip()
 
-        return text
+        if text:
 
-    except Exception as e:
+            return text
 
-        print(
-            f"Arduino-virhe: {e}"
+    return None
+
+
+def wait_for_ready(ser):
+
+    deadline = (
+        time.monotonic()
+        + 5.0
+    )
+
+    while (
+        time.monotonic()
+        < deadline
+    ):
+
+        line = read_serial_line(
+            ser,
+            timeout=0.5
         )
 
-        return None
+        if line is None:
+            continue
+
+        print(
+            f"Arduino: {line}"
+        )
+
+        if (
+            line
+            == "HEATER_CONTROLLER_READY"
+        ):
+
+            return True
+
+    return False
 
 
 # ============================================================
-# SET POWER
+# ARDUINO COMMANDS
 # ============================================================
 
-def set_power(power):
+def send_power(ser, power):
 
     power = int(
         max(
@@ -210,177 +235,169 @@ def set_power(power):
         )
     )
 
-    response = send_command(
-        f"SET_POWER {power}"
+    command = (
+        f"SET_POWER {power}\n"
     )
 
-    if response is None:
-
-        print(
-            "VAROITUS: Arduino ei vastannut."
-        )
-
-        return False
-
-    print(
-        f"Arduino: {response}"
+    expected = (
+        f"OK POWER={power}"
     )
-
-    expected = f"OK POWER={power}"
-
-    if response != expected:
-
-        print(
-            f"VAROITUS: odotettiin "
-            f"'{expected}'"
-        )
-
-        return False
-
-    return True
-
-
-# ============================================================
-# SMA API
-# ============================================================
-
-def get_grid_power():
 
     try:
 
-        response = requests.get(
-            API_URL,
-            timeout=2
+        # ----------------------------------------------------
+        # Lähetetään komento
+        # ----------------------------------------------------
+
+        ser.write(
+            command.encode("ascii")
         )
 
-        response.raise_for_status()
+        ser.flush()
 
-        data = response.json()
-
-        summary = data.get(
-            "summary",
-            {}
-        )
-
-        if "grid_power" not in summary:
-
-            raise RuntimeError(
-                "API-vastauksesta puuttuu grid_power"
-            )
-
-        return float(
-            summary["grid_power"]
-        )
-
-    except Exception as e:
+    except Exception as exc:
 
         print(
-            f"Controller virhe: {e}"
+            f"Arduino kirjoitusvirhe: "
+            f"{exc}"
         )
 
-        return None
+        return False
 
-
-# ============================================================
-# POWER CONTROL
-# ============================================================
-
-def calculate_step(grid_power):
 
     # --------------------------------------------------------
-    # DEAD BAND
+    # Odotetaan juuri oikeaa vastausta
     #
-    # -130 ... -70 W
+    # ALIVE POWER=...
+    # HEATER_CONTROLLER_READY
     #
-    # Ei muuteta lämmitystehoa.
+    # voidaan saada tässä välissä ja ne ohitetaan.
     # --------------------------------------------------------
 
-    if (
-        DEADBAND_LOW
-        <= grid_power
-        <= DEADBAND_HIGH
+    deadline = (
+        time.monotonic()
+        + SERIAL_TIMEOUT
+    )
+
+    while (
+        time.monotonic()
+        < deadline
     ):
 
-        return 0
-
-
-    # --------------------------------------------------------
-    # EXPORT
-    #
-    # grid_power < -130 W
-    #
-    # Mitä suurempi ylijäämä,
-    # sitä suurempi askel.
-    # --------------------------------------------------------
-
-    if grid_power < DEADBAND_LOW:
-
-        surplus = abs(
-            grid_power - TARGET_GRID_POWER
+        line = read_serial_line(
+            ser,
+            timeout=0.3
         )
 
-        if surplus > EXPORT_STEP_300:
-            return 300
+        if line is None:
 
-        if surplus > EXPORT_STEP_200:
-            return 200
-
-        if surplus > EXPORT_STEP_100:
-            return 100
-
-        if surplus > EXPORT_STEP_50:
-            return 50
-
-        return 0
+            continue
 
 
-    # --------------------------------------------------------
-    # IMPORT
-    #
-    # grid_power > -70 W
-    #
-    # Pienennetään lämmitystehoa.
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # Oikea vastaus
+        # ----------------------------------------------------
 
-    if grid_power > DEADBAND_HIGH:
+        if line == expected:
 
-        import_power = (
-            grid_power - TARGET_GRID_POWER
+            print(
+                f"Arduino: {line}"
+            )
+
+            return True
+
+
+        # ----------------------------------------------------
+        # Heartbeat
+        # ----------------------------------------------------
+
+        if line.startswith(
+            "ALIVE POWER="
+        ):
+
+            print(
+                f"Arduino heartbeat: {line}"
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # READY
+        # ----------------------------------------------------
+
+        if (
+            line
+            == "HEATER_CONTROLLER_READY"
+        ):
+
+            print(
+                f"Arduino: {line}"
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # Vanha OK POWER -vastaus
+        # ----------------------------------------------------
+
+        if line.startswith(
+            "OK POWER="
+        ):
+
+            print(
+                f"Arduino vanha vastaus: "
+                f"{line}"
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # Muu viesti
+        # ----------------------------------------------------
+
+        print(
+            f"Arduino muu viesti: "
+            f"{line}"
         )
 
-        if import_power > IMPORT_STEP_300:
-            return -300
-
-        if import_power > IMPORT_STEP_200:
-            return -200
-
-        if import_power > IMPORT_STEP_100:
-            return -100
-
-        if import_power > IMPORT_STEP_50:
-            return -50
-
-        return 0
-
-
-    return 0
-
-
-# ============================================================
-# STATUS DISPLAY
-# ============================================================
-
-def print_status(
-    grid_power,
-    current_power,
-    reason
-):
 
     print(
-        f"Grid: {grid_power:7.1f} W | "
-        f"Power: {current_power:4d} W | "
-        f"{reason}"
+        f"VAROITUS: Arduino ei vahvistanut "
+        f"tehoa {power} W."
     )
+
+    return False
+
+
+# ============================================================
+# SIGNAALIT
+# ============================================================
+
+controller_running = True
+
+
+def stop_controller(
+    signum=None,
+    frame=None
+):
+
+    global controller_running
+
+    controller_running = False
+
+
+signal.signal(
+    signal.SIGINT,
+    stop_controller
+)
+
+signal.signal(
+    signal.SIGTERM,
+    stop_controller
+)
 
 
 # ============================================================
@@ -389,24 +406,45 @@ def print_status(
 
 def main():
 
-    global running
+    global controller_running
 
     print()
-    print("SMA Heater Controller")
-    print("=====================")
+    print(
+        "SMA Heater Controller v2.0.1"
+    )
+    print(
+        "============================"
+    )
+
+    print()
+    print(
+        f"Yhdistetään Arduinoon: "
+        f"{SERIAL_PORT}"
+    )
 
 
     # --------------------------------------------------------
     # Arduino connection
     # --------------------------------------------------------
 
-    if not connect_arduino():
+    try:
+
+        ser = serial.Serial(
+            SERIAL_PORT,
+            SERIAL_BAUD,
+            timeout=0.2,
+            write_timeout=2
+        )
+
+    except Exception as exc:
 
         print()
         print(
-            "Arduino-yhteyttä ei voitu avata."
+            "Arduino-yhteyden avaus "
+            f"epäonnistui: {exc}"
         )
 
+        print()
         print(
             "Controller lopetetaan."
         )
@@ -414,8 +452,38 @@ def main():
         return 1
 
 
+    print()
+    print(
+        "Arduino-yhteys valmis."
+    )
+
+
     # --------------------------------------------------------
-    # Initial power = 0
+    # Arduino reset
+    # --------------------------------------------------------
+
+    time.sleep(2.0)
+
+
+    # --------------------------------------------------------
+    # READY
+    # --------------------------------------------------------
+
+    ready = wait_for_ready(
+        ser
+    )
+
+    if not ready:
+
+        print()
+        print(
+            "VAROITUS: Arduino READY-"
+            "viestiä ei vastaanotettu."
+        )
+
+
+    # --------------------------------------------------------
+    # Safe initial state
     # --------------------------------------------------------
 
     print()
@@ -423,11 +491,14 @@ def main():
         "Arduino initial: SET_POWER 0"
     )
 
-    if not set_power(0):
+    if not send_power(
+        ser,
+        0
+    ):
 
         print(
-            "VAROITUS: Arduino ei vahvistanut "
-            "käynnistystehoa."
+            "VAROITUS: Arduino ei "
+            "vahvistanut käynnistystehoa."
         )
 
 
@@ -435,7 +506,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Controller information
+    # Controller info
     # --------------------------------------------------------
 
     print()
@@ -444,6 +515,7 @@ def main():
     )
 
     print()
+
     print(
         f"Tavoite grid_power: "
         f"{TARGET_GRID_POWER:.0f} W"
@@ -456,55 +528,60 @@ def main():
     )
 
     print()
-
     print("Power steps:")
     print()
 
     print(
-        f"  Export >{EXPORT_STEP_300} W  : +300 W"
+        "  Export >500 W  : +300 W"
     )
 
     print(
-        f"  Export >{EXPORT_STEP_200} W  : +200 W"
+        "  Export >250 W  : +200 W"
     )
 
     print(
-        f"  Export >{EXPORT_STEP_100} W  : +100 W"
+        "  Export >100 W  : +100 W"
     )
 
     print(
-        f"  Export >{EXPORT_STEP_50} W   : +50 W"
+        "  Export >50 W   :  +50 W"
     )
 
     print(
-        "  Deadband           : ei muutosta"
+        "  Deadband        : ei muutosta"
     )
 
     print(
-        f"  Import >{IMPORT_STEP_300} W  : -300 W"
+        "  Import >500 W  : -300 W"
     )
 
     print(
-        f"  Import >{IMPORT_STEP_200} W  : -200 W"
+        "  Import >250 W  : -200 W"
     )
 
     print(
-        f"  Import >{IMPORT_STEP_100} W  : -100 W"
+        "  Import >100 W  : -100 W"
     )
 
     print(
-        f"  Import >{IMPORT_STEP_50} W   : -50 W"
+        "  Import >50 W   :  -50 W"
     )
 
     print()
 
     print(
-        f"Max power: {MAX_POWER} W"
+        f"Max power: "
+        f"{MAX_POWER} W"
     )
 
     print(
         f"Loop interval: "
         f"{LOOP_INTERVAL:.1f} s"
+    )
+
+    print(
+        f"Control delay: "
+        f"{CONTROL_DELAY:.1f} s"
     )
 
     print()
@@ -515,196 +592,288 @@ def main():
     print()
 
 
-    # ========================================================
-    # CONTROL LOOP
-    # ========================================================
+    # --------------------------------------------------------
+    # Control timing
+    # --------------------------------------------------------
 
-    while running:
-
-        grid_power = get_grid_power()
-
-
-        # ----------------------------------------------------
-        # API error
-        # ----------------------------------------------------
-
-        if grid_power is None:
-
-            # Turvallinen toimintatapa:
-            #
-            # API-virheen aikana emme muuta
-            # nykyistä lämmitystehoa.
-
-            time.sleep(
-                LOOP_INTERVAL
-            )
-
-            continue
-
-
-        # ----------------------------------------------------
-        # Calculate required power step
-        # ----------------------------------------------------
-
-        step = calculate_step(
-            grid_power
-        )
-
-
-        # ----------------------------------------------------
-        # No change
-        # ----------------------------------------------------
-
-        if step == 0:
-
-            if (
-                DEADBAND_LOW
-                <= grid_power
-                <= DEADBAND_HIGH
-            ):
-
-                reason = "Deadband"
-
-            else:
-
-                reason = "Raja"
-
-
-            print_status(
-                grid_power,
-                current_power,
-                reason
-            )
-
-
-        # ----------------------------------------------------
-        # Power change
-        # ----------------------------------------------------
-
-        else:
-
-            new_power = (
-                current_power
-                + step
-            )
-
-
-            # ------------------------------------------------
-            # Safety limits
-            # ------------------------------------------------
-
-            new_power = max(
-                0,
-                min(
-                    MAX_POWER,
-                    new_power
-                )
-            )
-
-
-            actual_step = (
-                new_power
-                - current_power
-            )
-
-
-            current_power = new_power
-
-
-            # ------------------------------------------------
-            # Display
-            # ------------------------------------------------
-
-            if actual_step > 0:
-
-                reason = (
-                    f"+{actual_step} W"
-                )
-
-            elif actual_step < 0:
-
-                reason = (
-                    f"{actual_step} W"
-                )
-
-            else:
-
-                reason = "Raja"
-
-
-            print_status(
-                grid_power,
-                current_power,
-                reason
-            )
-
-
-            # ------------------------------------------------
-            # Send to Arduino
-            # ------------------------------------------------
-
-            if actual_step != 0:
-
-                if not set_power(
-                    current_power
-                ):
-
-                    print(
-                        "Arduino-ohjaus epäonnistui."
-                    )
-
-
-        # ----------------------------------------------------
-        # Next control cycle
-        # ----------------------------------------------------
-
-        time.sleep(
-            LOOP_INTERVAL
-        )
-
-
-    # ========================================================
-    # SAFE SHUTDOWN
-    # ========================================================
-
-    print()
-
-    print(
-        "Controller pysäytetään..."
+    next_control_time = (
+        time.monotonic()
     )
 
 
-    if arduino is not None:
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
 
+    try:
+
+        while controller_running:
+
+            loop_start = (
+                time.monotonic()
+            )
+
+
+            # ------------------------------------------------
+            # SMA
+            # ------------------------------------------------
+
+            try:
+
+                grid_power = (
+                    read_grid_power()
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"Controller virhe: "
+                    f"{exc}"
+                )
+
+                time.sleep(
+                    LOOP_INTERVAL
+                )
+
+                continue
+
+
+            new_power = (
+                current_power
+            )
+
+            step = 0
+
+            reason = "HOLD"
+
+            now = (
+                time.monotonic()
+            )
+
+
+            # ------------------------------------------------
+            # Control decision
+            # ------------------------------------------------
+
+            if (
+                now
+                >= next_control_time
+            ):
+
+                step = (
+                    calculate_step(
+                        grid_power
+                    )
+                )
+
+
+                if step != 0:
+
+                    new_power = (
+                        current_power
+                        + step
+                    )
+
+                    new_power = max(
+                        0,
+                        min(
+                            MAX_POWER,
+                            new_power
+                        )
+                    )
+
+                    actual_step = (
+                        new_power
+                        - current_power
+                    )
+
+                    step = (
+                        actual_step
+                    )
+
+
+                    if step > 0:
+
+                        reason = (
+                            "EXPORT"
+                        )
+
+                    elif step < 0:
+
+                        reason = (
+                            "IMPORT"
+                        )
+
+                    else:
+
+                        reason = (
+                            "LIMIT"
+                        )
+
+                else:
+
+                    if (
+                        DEADBAND_LOW
+                        <= grid_power
+                        <= DEADBAND_HIGH
+                    ):
+
+                        reason = (
+                            "DEADBAND"
+                        )
+
+                    else:
+
+                        reason = (
+                            "HOLD"
+                        )
+
+
+                next_control_time = (
+                    now
+                    + CONTROL_DELAY
+                )
+
+
+            # ------------------------------------------------
+            # Status
+            # ------------------------------------------------
+
+            if step != 0:
+
+                print(
+                    f"Grid: "
+                    f"{grid_power:7.1f} W | "
+                    f"Power: "
+                    f"{new_power:4d} W | "
+                    f"{step:+4d} W | "
+                    f"{reason}"
+                )
+
+            else:
+
+                print(
+                    f"Grid: "
+                    f"{grid_power:7.1f} W | "
+                    f"Power: "
+                    f"{current_power:4d} W | "
+                    f"{reason}"
+                )
+
+
+            # ------------------------------------------------
+            # Arduino update
+            # ------------------------------------------------
+
+            if (
+                new_power
+                != current_power
+            ):
+
+                if send_power(
+                    ser,
+                    new_power
+                ):
+
+                    current_power = (
+                        new_power
+                    )
+
+                else:
+
+                    print(
+                        "Arduino-ohjaus "
+                        "epäonnistui."
+                    )
+
+
+            # ------------------------------------------------
+            # Loop timing
+            # ------------------------------------------------
+
+            elapsed = (
+                time.monotonic()
+                - loop_start
+            )
+
+            sleep_time = (
+                LOOP_INTERVAL
+                - elapsed
+            )
+
+            if sleep_time > 0:
+
+                time.sleep(
+                    sleep_time
+                )
+
+
+    finally:
+
+        # ====================================================
+        # SAFE SHUTDOWN
+        # ====================================================
+
+        print()
+        print(
+            "Controller pysäytetään..."
+        )
+
+        print()
         print(
             "Arduino: SET_POWER 0"
         )
 
-        set_power(0)
+
+        try:
+
+            if ser.is_open:
+
+                if not send_power(
+                    ser,
+                    0
+                ):
+
+                    print(
+                        "VAROITUS: Arduino ei "
+                        "vahvistanut nollausta."
+                    )
+
+        except Exception as exc:
+
+            print(
+                f"Arduino-nollauksen "
+                f"virhe: {exc}"
+            )
 
 
         try:
 
-            arduino.close()
+            if ser.is_open:
 
-            print(
-                "Arduino-yhteys suljetaan..."
-            )
+                ser.close()
 
         except Exception:
 
             pass
 
 
-    print(
-        "Controller pysäytetty."
-    )
+        print()
+        print(
+            "Arduino-yhteys suljetaan..."
+        )
+
+        print()
+        print(
+            "Controller pysäytetty."
+        )
+
 
     return 0
 
 
 # ============================================================
-# PROGRAM START
+# START
 # ============================================================
 
 if __name__ == "__main__":
