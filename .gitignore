@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Backup and old controller versions
+*.bak
+sma_controller.py
+sma_heater_controller_v1_direct.py
