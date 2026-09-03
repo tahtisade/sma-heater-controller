@@ -59,6 +59,9 @@ SERIAL_TIMEOUT = 2.0
 ARDUINO_VID = 0x2341
 ARDUINO_PID = 0x0043
 
+# RS41 heater controller USB-UART adapter (FT232R)
+RS41_SERIAL_NUMBER = "A10JEG9V"
+
 
 # ============================================================
 # SMA LOCAL PORTAL
@@ -202,7 +205,18 @@ def find_arduino():
     )
 
     # --------------------------------------------------------
-    # Ensisijaisesti tarkka VID/PID
+    # Ensisijainen ohjain: RS41
+    # Tunnistetaan yksilöllisellä USB-sarjanumerolla.
+    # --------------------------------------------------------
+
+    for port in ports:
+
+        if port.serial_number == RS41_SERIAL_NUMBER:
+
+            return port.device
+
+    # --------------------------------------------------------
+    # Varalaite: Arduino UNO tarkalla VID/PID-tunnisteella
     # --------------------------------------------------------
 
     for port in ports:
@@ -696,26 +710,36 @@ def wait_for_ready(ser):
         + 5.0
     )
 
+    next_status_query = 0.0
 
     while (
         time.monotonic()
         < deadline
     ):
 
+        now = time.monotonic()
+
+        if now >= next_status_query:
+            ser.write(
+                b"GET_STATUS\n"
+            )
+            ser.flush()
+
+            next_status_query = (
+                now + 1.0
+            )
+
         line = read_serial_line(
             ser,
             timeout=0.5
         )
 
-
         if line is None:
             continue
-
 
         print(
             f"Arduino: {line}"
         )
-
 
         if (
             line
@@ -724,6 +748,11 @@ def wait_for_ready(ser):
 
             return True
 
+        if line.startswith(
+            "STATUS POWER="
+        ):
+
+            return True
 
     return False
 
