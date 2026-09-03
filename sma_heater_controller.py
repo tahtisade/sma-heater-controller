@@ -99,16 +99,16 @@ DHW_MAX_VALID_TEMP = 100.0
 # SÄÄTÖ
 # ============================================================
 
-TARGET_GRID_POWER = -100.0
+TARGET_GRID_POWER = -200.0
 
-DEADBAND_LOW = -130.0
-DEADBAND_HIGH = -70.0
+DEADBAND_LOW = -250.0
+DEADBAND_HIGH = -150.0
 
 MIN_POWER = 0
 MAX_POWER = 6000
 
 LOOP_INTERVAL = 1.0
-CONTROL_DELAY = 1.0
+CONTROL_DELAY = 2.0
 
 
 # ============================================================
@@ -146,8 +146,8 @@ UP_STEP_FINE = 50
 # Tarkoituksella noin 2 x ramp-up.
 # ============================================================
 
-DOWN_STEP_LARGE = 600
-DOWN_STEP_MEDIUM = 400
+DOWN_STEP_LARGE = 400
+DOWN_STEP_MEDIUM = 300
 DOWN_STEP_SMALL = 200
 DOWN_STEP_FINE = 100
 
