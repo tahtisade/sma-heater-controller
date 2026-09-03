@@ -377,6 +377,26 @@ def read_sma_status():
             spot_price_limit
         )
 
+    heater_max_power = heater_control.get(
+        "max_power"
+    )
+
+    if heater_max_power is None:
+        heater_max_power = MAX_POWER
+    else:
+        heater_max_power = int(
+            heater_max_power
+        )
+
+    heater_max_power = max(
+        MIN_POWER,
+        min(
+            MAX_POWER,
+            heater_max_power
+        )
+    )
+
+
     return (
         grid_power,
         dhw_temperature,
@@ -388,6 +408,7 @@ def read_sma_status():
         spot_end,
         heater_mode,
         spot_price_limit,
+        heater_max_power,
     )
 
 def validate_dhw_temperature(
@@ -1157,6 +1178,7 @@ def main():
                    spot_end,
                    heater_mode,
                    spot_price_limit,
+                   heater_max_power,
                ) = read_sma_status()
 
                api_failures = 0
@@ -1379,7 +1401,7 @@ def main():
 
             elif heater_mode == "on":
 
-               new_power = MAX_POWER
+               new_power = heater_max_power
 
                step = (
                   new_power
@@ -1435,7 +1457,7 @@ def main():
                new_power = max(
                    MIN_POWER,
                    min(
-                        MAX_POWER,
+                        heater_max_power,
                         new_power
                    )
                )
@@ -1506,6 +1528,8 @@ def main():
                 f"{spot_price_limit:5.1f} c/kWh | "
                 f"Mode: "
                 f"{heater_mode:8s} | "
+                f"Max: "
+                f"{heater_max_power:4d} W | "
                 f"Power: "
                 f"{new_power:4d} W | "
                 f"{step:+4d} W | "
