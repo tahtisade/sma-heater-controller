@@ -42,7 +42,7 @@ from serial.tools import list_ports
 # VERSION
 # ============================================================
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 
 # ============================================================
@@ -1570,30 +1570,26 @@ def main():
                 reason
             )
 
+
             # =================================================
-            # ARDUINO
+            # HEATER CONTROLLER
             # =================================================
 
-            if (
+            if send_power(
+                ser,
                 new_power
-                != current_power
             ):
 
-                if send_power(
-                    ser,
+                current_power = (
                     new_power
-                ):
+                )
 
-                    current_power = (
-                        new_power
-                    )
+            else:
 
-                else:
-
-                    print(
-                        "Arduino-ohjaus "
-                        "epäonnistui."
-                    )
+                print(
+                    "Heater controller -ohjaus "
+                    "epäonnistui."
+                )
 
 
             # =================================================
