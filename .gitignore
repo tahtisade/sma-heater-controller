@@ -3,5 +3,24 @@ __pycache__/
 
 # Backup and old controller versions
 *.bak
+*.bak-*
+*.before-*
+*.before-public-*
 sma_controller.py
 sma_heater_controller_v1_direct.py
+
+# Logs
+*.log
+
+# Local/private configuration
+.env
+.env.*
+settings.yaml
+config.yaml
+
+# Editor / OS files
+.DS_Store
+*~
+
+# Local development / measurement tests
+heater_pwm_test.py

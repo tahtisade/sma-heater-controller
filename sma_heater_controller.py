@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
 
 """
-SMA Heater Controller v2.2.0
+SMA Heater Controller v2.5.0
 ============================
 
-Muutokset v2.0.1 -> v2.1.0 -> v2.2.0:
+Host-side controller for surplus-energy based resistive heating.
 
-- Resol säätimen tuottama lämpötila-arvo käyttöveden säiliölle, LKV 500l
+Features:
+- Reads grid power and heater configuration from SMA Local Portal.
+- Controls up to 6000 W of resistive heating.
+- Supports Arduino UNO and optional RS41-based heater controllers.
+- Automatically detects Arduino UNO by USB VID/PID.
+- RS41 USB-UART adapter can be selected with HEATER_RS41_SERIAL.
+- Uses EMA filtering and asymmetric ramp-up/ramp-down control.
+- Supports OFF, ON, PV, PV+PRICE and PRICE operating modes.
+- PRICE mode supports a configurable local-time operating window.
+- Monitors domestic hot water temperature and applies a safety limit.
+- Applies fail-safe 0 W output on repeated API or sensor failures.
+- Starts and stops safely at 0 W.
 
-- Arduino UNO tunnistetaan automaattisesti.
-  /dev/ttyACM0 tai /dev/ttyACM1 ei tarvitse enää määrittää käsin.
+The host communicates with the heater controller over a serial link.
+The controller drives three independently time-proportioned outputs
+intended for the low-voltage control side of suitable SSRs.
 
-- Kevyt EMA-suodatus SMA grid_power -mittaukselle.
-
-- Ramp-down on nopeampi kuin ramp-up:
-  verkostaoston alkaessa vastustehoa vähennetään nopeammin.
-
-- ALIVE POWER=... -viestit käsitellään oikein.
-
-- 3 peräkkäistä SMA API -virhettä -> SET_POWER 0.
-
-- Käynnistys ja pysäytys aina turvallisesti 0 W.
-
-Nykyinen käyttö:
-    Arduino -> LEDit
-
-Myöhemmin:
-    Arduino -> välirele/SSR -> teho-SSR -> 3 x 2 kW vastukset
+Mains-voltage wiring and protection are outside the scope of this
+software and must be implemented using appropriate electrical safety
+practices and equipment.
 """
 
+import os
 import time
 import signal
 import sys
@@ -42,7 +42,7 @@ from serial.tools import list_ports
 # VERSION
 # ============================================================
 
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 
 
 # ============================================================
@@ -59,8 +59,11 @@ SERIAL_TIMEOUT = 2.0
 ARDUINO_VID = 0x2341
 ARDUINO_PID = 0x0043
 
-# RS41 heater controller USB-UART adapter (FT232R)
-RS41_SERIAL_NUMBER = "A10JEG9V"
+# Optional RS41 heater controller USB-UART adapter (FT232R).
+# Set HEATER_RS41_SERIAL to the serial number of the adapter.
+RS41_SERIAL_NUMBER = os.environ.get(
+    "HEATER_RS41_SERIAL"
+)
 
 
 # ============================================================
@@ -209,11 +212,13 @@ def find_arduino():
     # Tunnistetaan yksilöllisellä USB-sarjanumerolla.
     # --------------------------------------------------------
 
-    for port in ports:
+    if RS41_SERIAL_NUMBER:
 
-        if port.serial_number == RS41_SERIAL_NUMBER:
+        for port in ports:
 
-            return port.device
+            if port.serial_number == RS41_SERIAL_NUMBER:
+
+                return port.device
 
     # --------------------------------------------------------
     # Varalaite: Arduino UNO tarkalla VID/PID-tunnisteella
@@ -317,7 +322,7 @@ def read_sma_status():
     )
 
     dhw_temperature = resol.get(
-        "LKV 500l"
+        "temperature"
     )
 
     dhw_timestamp = resol.get(
@@ -410,6 +415,15 @@ def read_sma_status():
         )
     )
 
+    heater_price_start = heater_control.get(
+        "price_start",
+        "00:00"
+    )
+
+    heater_price_end = heater_control.get(
+        "price_end",
+        "06:00"
+    )
 
     return (
         grid_power,
@@ -423,6 +437,8 @@ def read_sma_status():
         heater_mode,
         spot_price_limit,
         heater_max_power,
+        heater_price_start,
+        heater_price_end,
     )
 
 def validate_dhw_temperature(
@@ -700,7 +716,7 @@ def read_serial_line(
 
 
 # ============================================================
-# WAIT FOR ARDUINO READY
+# WAIT FOR CONTROLLER READY
 # ============================================================
 
 def wait_for_ready(ser):
@@ -738,7 +754,7 @@ def wait_for_ready(ser):
             continue
 
         print(
-            f"Arduino: {line}"
+            f"Controller: {line}"
         )
 
         if (
@@ -799,7 +815,7 @@ def send_power(
     except Exception as exc:
 
         print(
-            f"Arduino kirjoitusvirhe: "
+            f"Controller kirjoitusvirhe: "
             f"{exc}"
         )
 
@@ -840,10 +856,6 @@ def send_power(
 
         if line == expected:
 
-            print(
-                f"Arduino: {line}"
-            )
-
             return True
 
 
@@ -856,7 +868,7 @@ def send_power(
         ):
 
             print(
-                f"Arduino heartbeat: "
+                f"Controller heartbeat: "
                 f"{line}"
             )
 
@@ -864,7 +876,7 @@ def send_power(
 
 
         # ----------------------------------------------------
-        # Arduino reset / READY
+        # Controller reset / READY
         # ----------------------------------------------------
 
         if (
@@ -873,7 +885,7 @@ def send_power(
         ):
 
             print(
-                f"Arduino: {line}"
+                f"Controller: {line}"
             )
 
             continue
@@ -888,7 +900,7 @@ def send_power(
         ):
 
             print(
-                f"Arduino vanha vastaus: "
+                f"Controller vanha vastaus: "
                 f"{line}"
             )
 
@@ -896,13 +908,13 @@ def send_power(
 
 
         print(
-            f"Arduino muu viesti: "
+            f"Controller muu viesti: "
             f"{line}"
         )
 
 
     print(
-        f"VAROITUS: Arduino ei "
+        f"VAROITUS: Controller ei "
         f"vahvistanut tehoa {power} W."
     )
 
@@ -939,6 +951,77 @@ def report_controller_status(
 # MAIN
 # ============================================================
 
+def is_time_in_window(
+    start_time,
+    end_time,
+    current_time=None
+):
+    """
+    Tarkistaa, onko paikallinen kellonaika
+    annetussa aikaikkunassa.
+
+    Tukee myös keskiyön ylittäviä jaksoja,
+    esimerkiksi 22:00-06:00.
+
+    Sama alku- ja loppuaika tarkoittaa
+    koko vuorokauden aktiivista jaksoa.
+    """
+
+    if current_time is None:
+        current_time = time.localtime()
+
+    try:
+        start_hour, start_minute = (
+            int(value)
+            for value in start_time.split(":")
+        )
+
+        end_hour, end_minute = (
+            int(value)
+            for value in end_time.split(":")
+        )
+
+    except (ValueError, AttributeError):
+        return False
+
+    if not (
+        0 <= start_hour <= 23
+        and 0 <= start_minute <= 59
+        and 0 <= end_hour <= 23
+        and 0 <= end_minute <= 59
+    ):
+        return False
+
+    start_minutes = (
+        start_hour * 60
+        + start_minute
+    )
+
+    end_minutes = (
+        end_hour * 60
+        + end_minute
+    )
+
+    current_minutes = (
+        current_time.tm_hour * 60
+        + current_time.tm_min
+    )
+
+    if start_minutes == end_minutes:
+        return True
+
+    if start_minutes < end_minutes:
+        return (
+            start_minutes
+            <= current_minutes
+            < end_minutes
+        )
+
+    return (
+        current_minutes >= start_minutes
+        or current_minutes < end_minutes
+    )
+
 def main():
 
     global controller_running
@@ -960,7 +1043,7 @@ def main():
 
     print()
     print(
-        "Etsitään Arduino UNO..."
+        "Etsitään heater controller..."
     )
 
 
@@ -971,7 +1054,7 @@ def main():
 
         print()
         print(
-            "Arduino UNOa ei löytynyt."
+            "Heater controlleria ei löytynyt."
         )
 
         print(
@@ -982,7 +1065,7 @@ def main():
 
 
     print(
-        f"Arduino löytyi: "
+        f"Heater controller löytyi: "
         f"{serial_port}"
     )
 
@@ -1005,7 +1088,7 @@ def main():
 
         print()
         print(
-            f"Arduino-yhteyden avaus "
+            f"Heater controller -yhteyden avaus "
             f"epäonnistui: {exc}"
         )
 
@@ -1013,7 +1096,7 @@ def main():
 
 
     print(
-        "Arduino-yhteys valmis."
+        "Heater controller -yhteys valmis."
     )
 
 
@@ -1033,7 +1116,7 @@ def main():
 
         print()
         print(
-            "VAROITUS: Arduino READY-"
+            "VAROITUS: Controller READY-"
             "viestiä ei vastaanotettu."
         )
 
@@ -1044,7 +1127,7 @@ def main():
 
     print()
     print(
-        "Arduino initial: SET_POWER 0"
+        "Heater controller initial: SET_POWER 0"
     )
 
 
@@ -1054,7 +1137,7 @@ def main():
     ):
 
         print(
-            "VAROITUS: Arduino ei "
+            "VAROITUS: Controller ei "
             "vahvistanut käynnistystehoa."
         )
 
@@ -1173,6 +1256,7 @@ def main():
     )
 
     api_failures = 0
+    next_status_print = time.monotonic()
 
     # Käynnistetään turvallisesti lukittuna.
     # Ensimmäinen kelvollinen alle 69 °C mittaus vapauttaa lukon.
@@ -1208,6 +1292,8 @@ def main():
                    heater_mode,
                    spot_price_limit,
                    heater_max_power,
+                   heater_price_start,
+                   heater_price_end,
                ) = read_sma_status()
 
                api_failures = 0
@@ -1283,14 +1369,19 @@ def main():
                    LOOP_INTERVAL
                )
 
+               continue
+
 
             # =================================================
             # SPOT PRICE FAIL-SAFE
             #
-            # Spot-hintaa tarvitaan vain PV + PRICE -tilassa.
+            # Spot-hintaa tarvitaan PV + PRICE- ja PRICE-tiloissa.
             # =================================================
 
-            if heater_mode == "pv_price":
+            if heater_mode in (
+                "pv_price",
+                "price",
+            ):
 
                 spot_valid, spot_info = (
                    validate_spot_price(
@@ -1441,6 +1532,69 @@ def main():
 
 
             # -------------------------------------------------
+            # 4. PRICE
+            #
+            # Hinta-tila ei käytä PV-ylijäämää.
+            #
+            # Lämmitys sallitaan täydellä asetetulla
+            # maksimiteholla, kun:
+            #
+            # - ollaan sallitussa aikaikkunassa
+            # - spot-hinta on hintarajan alapuolella
+            #   tai yhtä suuri kuin hintaraja
+            #
+            # DHW-raja ja spot fail-safe on käsitelty
+            # jo ennen tätä kohtaa.
+            # -------------------------------------------------
+
+            elif heater_mode == "price":
+
+                price_time_active = (
+                    is_time_in_window(
+                        heater_price_start,
+                        heater_price_end
+                    )
+                )
+
+                if not price_time_active:
+
+                    new_power = 0
+
+                    step = (
+                        new_power
+                        - current_power
+                    )
+
+                    reason = "PRICE_TIME"
+
+                elif (
+                    spot_price
+                    > spot_price_limit
+                ):
+
+                    new_power = 0
+
+                    step = (
+                        new_power
+                        - current_power
+                    )
+
+                    reason = "SPOT_HIGH"
+
+                else:
+
+                    new_power = (
+                        heater_max_power
+                    )
+
+                    step = (
+                        new_power
+                        - current_power
+                    )
+
+                    reason = "PRICE_ON"
+
+            # -------------------------------------------------
             # 4. PV + PRICE
             # -------------------------------------------------
 
@@ -1529,6 +1683,7 @@ def main():
                 "on",
                 "pv",
                 "pv_price",
+                "price",
             ):
 
                 new_power = 0
@@ -1544,26 +1699,33 @@ def main():
             # STATUS PRINT
             # =================================================
 
-            print(
-                f"Grid raw: "
-                f"{raw_grid:7.1f} W | "
-                f"Filtered: "
-                f"{filtered_grid:7.1f} W | "
-                f"DHW: "
-                f"{dhw_temperature:4.1f} °C | "
-                f"Spot: "
-                f"{spot_price:6.3f} c/kWh | "
-                f"Limit: "
-                f"{spot_price_limit:5.1f} c/kWh | "
-                f"Mode: "
-                f"{heater_mode:8s} | "
-                f"Max: "
-                f"{heater_max_power:4d} W | "
-                f"Power: "
-                f"{new_power:4d} W | "
-                f"{step:+4d} W | "
-                f"{reason}"
-            )
+            if time.monotonic() >= next_status_print:
+
+                print(
+                    f"Grid raw: "
+                    f"{raw_grid:7.1f} W | "
+                    f"Filtered: "
+                    f"{filtered_grid:7.1f} W | "
+                    f"DHW: "
+                    f"{dhw_temperature:4.1f} °C | "
+                    f"Spot: "
+                    f"{spot_price:6.3f} c/kWh | "
+                    f"Limit: "
+                    f"{spot_price_limit:5.1f} c/kWh | "
+                    f"Mode: "
+                    f"{heater_mode:8s} | "
+                    f"Max: "
+                    f"{heater_max_power:4d} W | "
+                    f"Power: "
+                    f"{new_power:4d} W | "
+                    f"{step:+4d} W | "
+                    f"{reason}"
+                )
+
+                next_status_print = (
+                    time.monotonic()
+                    + 30.0
+                )
 
             report_controller_status(
                 new_power,
@@ -1628,7 +1790,7 @@ def main():
 
         print()
         print(
-            "Arduino: SET_POWER 0"
+            "Heater controller: SET_POWER 0"
         )
 
 
@@ -1642,14 +1804,14 @@ def main():
                 ):
 
                     print(
-                        "VAROITUS: Arduino ei "
+                        "VAROITUS: Controller ei "
                         "vahvistanut nollausta."
                     )
 
         except Exception as exc:
 
             print(
-                f"Arduino-nollauksen "
+                f"Controller-nollauksen "
                 f"virhe: {exc}"
             )
 
@@ -1667,7 +1829,7 @@ def main():
 
         print()
         print(
-            "Arduino-yhteys suljettu."
+            "Heater controller -yhteys suljettu."
         )
 
         print(

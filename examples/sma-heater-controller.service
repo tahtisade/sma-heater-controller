@@ -1,0 +1,17 @@
+[Unit]
+Description=SMA Heater Controller
+After=network-online.target sma-local-portal.service
+Wants=network-online.target
+Requires=sma-local-portal.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/heater_controller
+EnvironmentFile=-/etc/sma-heater-controller.env
+ExecStart=/usr/bin/python3 -u /path/to/heater_controller/sma_heater_controller.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
