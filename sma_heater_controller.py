@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-
 """
-SMA Heater Controller v2.5.0
+SMA Heater Controller v2.5.2
 ============================
 
 Host-side controller for surplus-energy based resistive heating.
@@ -15,9 +13,11 @@ Features:
 - Uses EMA filtering and asymmetric ramp-up/ramp-down control.
 - Supports OFF, ON, PV, PV+PRICE and PRICE operating modes.
 - PRICE mode supports a configurable local-time operating window.
-- Monitors domestic hot water temperature and applies a safety limit.
+- Uses a configurable DHW temperature target, 2 °C hysteresis and a hard 71 °C maximum.
 - Applies fail-safe 0 W output on repeated API or sensor failures.
 - Starts and stops safely at 0 W.
+- Reconnects after serial errors or missing acknowledgements (5 s retry).
+- Requires a confirmed 0 W command before resuming after reconnection.
 
 The host communicates with the heater controller over a serial link.
 The controller drives three independently time-proportioned outputs
@@ -29,6 +29,7 @@ practices and equipment.
 """
 
 import os
+import math
 import time
 import signal
 import sys
@@ -42,7 +43,7 @@ from serial.tools import list_ports
 # VERSION
 # ============================================================
 
-VERSION = "2.5.0"
+VERSION = "2.5.2"
 
 
 # ============================================================
@@ -51,6 +52,7 @@ VERSION = "2.5.0"
 
 SERIAL_BAUD = 9600
 SERIAL_TIMEOUT = 2.0
+SERIAL_RECONNECT_INTERVAL = 5.0
 
 # Arduino UNO R3:
 # Vendor  = 0x2341
@@ -220,6 +222,9 @@ def find_arduino():
 
                 return port.device
 
+        # Explicit RS41 selection must not switch to an unrelated UNO.
+        return None
+
     # --------------------------------------------------------
     # Varalaite: Arduino UNO tarkalla VID/PID-tunnisteella
     # --------------------------------------------------------
@@ -263,6 +268,24 @@ def find_arduino():
 # ============================================================
 # SMA API
 # ============================================================
+
+def dhw_target_limits(target):
+    if isinstance(target, bool):
+        raise ValueError("Invalid DHW temperature target")
+    target = float(target)
+    if not math.isfinite(target) or not 40.0 <= target <= DHW_MAX_TEMP:
+        raise ValueError("DHW temperature target must be 40–71 °C")
+    return target, target - (DHW_MAX_TEMP - DHW_RESUME_TEMP)
+
+
+def dhw_temperature_locked(temperature, locked, target):
+    cutoff, resume = dhw_target_limits(target)
+    if temperature >= cutoff:
+        return True
+    if temperature <= resume:
+        return False
+    return locked
+
 
 def read_sma_status():
     """
@@ -425,6 +448,10 @@ def read_sma_status():
         "06:00"
     )
 
+    heater_temperature_target, _ = dhw_target_limits(
+        heater_control.get("temperature_target", DHW_MAX_TEMP)
+    )
+
     return (
         grid_power,
         dhw_temperature,
@@ -439,6 +466,7 @@ def read_sma_status():
         heater_max_power,
         heater_price_start,
         heater_price_end,
+        heater_temperature_target,
     )
 
 def validate_dhw_temperature(
@@ -777,7 +805,7 @@ def wait_for_ready(ser):
 # SEND POWER
 # ============================================================
 
-def send_power(
+def _send_power(
     ser,
     power
 ):
@@ -921,9 +949,84 @@ def send_power(
     return False
 
 
+def send_power(ser, power):
+    """Any write/read error or missing ACK invalidates this connection."""
+    try:
+        if _send_power(ser, power):
+            return True
+    except Exception as exc:
+        print(f"Controller sarjayhteysvirhe: {exc}")
+    ser.close()
+    return False
+
+
+class ControllerConnection:
+    """Re-enumerate the selected device; never reuse a failed USB handle."""
+
+    def __init__(self):
+        self.handle = None
+        self.next_attempt = 0.0
+
+    @property
+    def is_open(self):
+        return self.handle is not None and self.handle.is_open
+
+    def __getattr__(self, name):
+        if self.handle is None:
+            raise serial.SerialException("Controller ei ole yhdistetty")
+        return getattr(self.handle, name)
+
+    def close(self):
+        handle, self.handle = self.handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self.next_attempt = time.monotonic() + SERIAL_RECONNECT_INTERVAL
+
+    def ensure_connected(self):
+        if self.is_open:
+            return True
+        if time.monotonic() < self.next_attempt or not controller_running:
+            return False
+        try:
+            port = find_arduino()
+            if port is None:
+                raise serial.SerialException("Heater controlleria ei löytynyt")
+            print(f"Heater controller löytyi: {port}")
+            self.handle = serial.Serial(
+                port, SERIAL_BAUD, timeout=0.2, write_timeout=2
+            )
+            # UNO resets when opening its port. Stop signals remain effective.
+            deadline = time.monotonic() + 2.0
+            while controller_running and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not controller_running:
+                self.close()
+                return False
+            if not wait_for_ready(self):
+                raise serial.SerialException("Controller ei vastannut tilakyselyyn")
+            # Discard startup/status messages before sending the safe command.
+            self.reset_input_buffer()
+            if not send_power(self, 0):
+                raise serial.SerialException("Controller ei kuitannut nollatehoa")
+            if not controller_running:
+                send_power(self, 0)
+                self.close()
+                return False
+            print("Heater controller -yhteys palautettu: 0 W vahvistettu.")
+            return True
+        except Exception as exc:
+            print(f"Controller OFFLINE: {exc}; uusi yritys 5 s kuluttua.")
+            self.close()
+            return False
+
+
 def report_controller_status(
     power,
-    reason
+    reason,
+    controller_status,
 ):
     try:
         response = requests.post(
@@ -931,6 +1034,9 @@ def report_controller_status(
             json={
                 "power": int(power),
                 "reason": str(reason),
+                "controller_status": str(
+                    controller_status
+                ),
             },
             timeout=1.0
         )
@@ -1037,110 +1143,8 @@ def main():
     )
 
 
-    # ========================================================
-    # ARDUINO AUTODETECTION
-    # ========================================================
-
-    print()
-    print(
-        "Etsitään heater controller..."
-    )
-
-
-    serial_port = find_arduino()
-
-
-    if serial_port is None:
-
-        print()
-        print(
-            "Heater controlleria ei löytynyt."
-        )
-
-        print(
-            "Controller lopetetaan."
-        )
-
-        return 1
-
-
-    print(
-        f"Heater controller löytyi: "
-        f"{serial_port}"
-    )
-
-
-    # ========================================================
-    # SERIAL CONNECTION
-    # ========================================================
-
-    try:
-
-        ser = serial.Serial(
-            serial_port,
-            SERIAL_BAUD,
-            timeout=0.2,
-            write_timeout=2
-        )
-
-
-    except Exception as exc:
-
-        print()
-        print(
-            f"Heater controller -yhteyden avaus "
-            f"epäonnistui: {exc}"
-        )
-
-        return 1
-
-
-    print(
-        "Heater controller -yhteys valmis."
-    )
-
-
-    # Arduino UNO voi resetointua
-    # kun sarjaportti avataan.
-
-    time.sleep(2.0)
-
-
-    # ========================================================
-    # READY
-    # ========================================================
-
-    if not wait_for_ready(
-        ser
-    ):
-
-        print()
-        print(
-            "VAROITUS: Controller READY-"
-            "viestiä ei vastaanotettu."
-        )
-
-
-    # ========================================================
-    # SAFE START
-    # ========================================================
-
-    print()
-    print(
-        "Heater controller initial: SET_POWER 0"
-    )
-
-
-    if not send_power(
-        ser,
-        0
-    ):
-
-        print(
-            "VAROITUS: Controller ei "
-            "vahvistanut käynnistystehoa."
-        )
-
+    # Connection attempts also run while the device is absent at startup.
+    ser = ControllerConnection()
 
     current_power = 0
 
@@ -1222,12 +1226,12 @@ def main():
         f"Max power: {MAX_POWER} W"
     )
     print(
-        f"DHW max temperature: "
+        f"DHW hard maximum temperature: "
         f"{DHW_MAX_TEMP:.1f} °C"
     )
 
     print(
-        f"DHW resume temperature: "
+        f"DHW default resume temperature: "
         f"{DHW_RESUME_TEMP:.1f} °C"
     )
 
@@ -1259,7 +1263,8 @@ def main():
     next_status_print = time.monotonic()
 
     # Käynnistetään turvallisesti lukittuna.
-    # Ensimmäinen kelvollinen alle 69 °C mittaus vapauttaa lukon.
+    # Kelvollinen mittaus tavoite - 2 °C tai alempana vapauttaa lukon.
+    last_temperature_target = None
     dhw_locked = True
 
     # ========================================================
@@ -1274,6 +1279,24 @@ def main():
                 time.monotonic()
             )
 
+
+            # A failed send closes the handle, including fail-safe sends.
+            # Resume only after re-enumeration and a confirmed SET_POWER 0.
+            if not ser.is_open:
+                if not ser.ensure_connected():
+                    report_controller_status(
+                        current_power, "SERIAL_CONNECTION_LOST", "OFFLINE"
+                    )
+                    # current_power is last confirmed power, not measured output.
+                    if controller_running:
+                        time.sleep(LOOP_INTERVAL)
+                    continue
+                current_power = 0
+                filtered_grid = None
+                api_failures = 0
+                dhw_locked = True
+                next_control_time = time.monotonic()
+                report_controller_status(0, "SERIAL_RECONNECTED", "ONLINE")
 
             # =================================================
             # SMA
@@ -1294,6 +1317,7 @@ def main():
                    heater_max_power,
                    heater_price_start,
                    heater_price_end,
+                   heater_temperature_target,
                ) = read_sma_status()
 
                api_failures = 0
@@ -1414,22 +1438,18 @@ def main():
             # KÄYTTÖVEDEN LÄMPÖTILAHYSTEREESI
             # =================================================
 
+            if heater_temperature_target != last_temperature_target:
+                cutoff, resume = dhw_target_limits(heater_temperature_target)
+                print(f"DHW tavoite: {cutoff:.1f} °C; jatkuu: {resume:.1f} °C; yläraja: {DHW_MAX_TEMP:.1f} °C")
+                last_temperature_target = heater_temperature_target
+
             previous_dhw_locked = (
                 dhw_locked
             )
 
-            if (
-               dhw_temperature
-               >= DHW_MAX_TEMP
-            ):
-               dhw_locked = True
-
-            elif (
-               dhw_temperature
-               <= DHW_RESUME_TEMP
-            ):
-               dhw_locked = False
-
+            dhw_locked = dhw_temperature_locked(
+                dhw_temperature, dhw_locked, heater_temperature_target
+            )
 
             if (
                dhw_locked
@@ -1438,14 +1458,15 @@ def main():
                if dhw_locked:
                   print(
                       f"DHW {dhw_temperature:.1f} °C "
-                      f"-> MAX TEMP -> "
+                      f"-> tavoite {heater_temperature_target:.1f} °C -> "
                       f"lämmitys estetty"
                   )
 
                else:
                   print(
                        f"DHW {dhw_temperature:.1f} °C "
-                       f"-> lämpötilalukko vapautettu"
+                       f"-> lämpötilalukko vapautettu "
+                       f"(tavoite {heater_temperature_target:.1f} °C)"
                   )
 
             # =================================================
@@ -1727,31 +1748,41 @@ def main():
                     + 30.0
                 )
 
-            report_controller_status(
-                new_power,
-                reason
-            )
-
-
             # =================================================
             # HEATER CONTROLLER
             # =================================================
 
-            if send_power(
+            controller_ok = send_power(
                 ser,
                 new_power
-            ):
+            )
+
+            if controller_ok:
 
                 current_power = (
                     new_power
                 )
 
+                controller_status = (
+                    "ONLINE"
+                )
+
             else:
+
+                controller_status = (
+                    "OFFLINE"
+                )
 
                 print(
                     "Heater controller -ohjaus "
                     "epäonnistui."
                 )
+
+            report_controller_status(
+                current_power,
+                reason,
+                controller_status,
+            )
 
 
             # =================================================
